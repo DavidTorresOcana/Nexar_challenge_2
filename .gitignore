@@ -1,0 +1,13 @@
+yolo.h5
+*.jpg
+*.zip
+./tests/kitti-ssd
+./tests/SSD-Tensorflow
+*.h5
+*.npz
+./test/*
+./yad2k/
+*.mp4
+*.weights
+__pycache__/*
+__pycache__/
