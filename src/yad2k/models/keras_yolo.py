@@ -382,13 +382,14 @@ def preprocess_true_boxes(true_boxes, anchors, image_size):
     assert width % 32 == 0, 'Image sizes in YOLO_v2 must be multiples of 32.'
     conv_height = height // 32
     conv_width = width // 32
+#     print(conv_width,conv_height)
     num_box_params = true_boxes.shape[1]
     detectors_mask = np.zeros(
         (conv_height, conv_width, num_anchors, 1), dtype=np.float32)
     matching_true_boxes = np.zeros(
         (conv_height, conv_width, num_anchors, num_box_params),
         dtype=np.float32)
-
+#     print(detectors_mask.shape)
     for box in true_boxes:
         # scale box to convolutional feature spatial dimensions
         box_class = box[4:5]
