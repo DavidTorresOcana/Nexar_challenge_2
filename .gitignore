@@ -11,3 +11,4 @@ yolo.h5
 *.weights
 __pycache__/*
 __pycache__/
+.ipynb_checkpoints
