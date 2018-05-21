@@ -51,12 +51,12 @@ def draw_boxes(image, out_scores, out_boxes, out_classes, class_names, colors):
     
     font = ImageFont.truetype(font='font/FiraMono-Medium.otf',size=np.floor(3e-2 * image.size[1] + 0.5).astype('int32'))
     thickness = (image.size[0] + image.size[1]) // 300
-
+    print(out_classes,out_scores)
     for i, c in reversed(list(enumerate(out_classes))):
         predicted_class = class_names[c]
         box = out_boxes[i]
         score = out_scores[i]
-
+        print(predicted_class,score)
         label = '{} {:.2f}'.format(predicted_class, score)
 
         draw = ImageDraw.Draw(image)
