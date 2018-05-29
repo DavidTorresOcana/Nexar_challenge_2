@@ -1,0 +1,290 @@
+import pandas as pd
+from scipy import misc
+import argparse
+from matplotlib.pyplot import imshow
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
+import scipy.io
+import scipy.misc
+import os, sys
+import shutil
+import fnmatch
+import math
+import random, shutil
+from PIL import Image
+import numpy as np
+import tensorflow as tf
+from keras import backend as K
+from keras.layers import Input, Lambda, Conv2D
+from keras.models import load_model, Model
+from keras import optimizers
+from keras.callbacks import TensorBoard, ModelCheckpoint, EarlyStopping
+
+from yolo_utils import read_classes, read_anchors, generate_colors, preprocess_image, draw_boxes, scale_boxes
+from retrain_yolo import process_data,process_data_pil,get_classes,get_anchors,get_detector_mask,train,draw
+from yad2k.models.keras_yolo import yolo_head, yolo_boxes_to_corners, preprocess_true_boxes, yolo_loss, yolo_body, yolo_eval
+
+
+def predict_any(sess , model, image_file, anchors, class_names, max_boxes, score_threshold, iou_threshold):
+    
+    # Get head of model
+    yolo_outputs_ = yolo_head(model.output, anchors, len(class_names))
+    input_image_shape = K.placeholder(shape=(2, ))
+
+    # Preprocess your image
+    model_image_size =  model.inputs[0].get_shape().as_list()[-3:-1]
+    image, image_data = preprocess_image(image_file, model_image_size =  model_image_size )
+    
+    img=plt.imread(image_file)
+    img_shape_ = img.shape[0:2]
+    print(  "Reshaping input image "+str( img_shape_)  +" to model input shape "+str(model_image_size)  )
+    
+    # Get the Tensors
+    boxes, scores, classes = yolo_eval(yolo_outputs_, [float(i) for i in list(img_shape_)],
+                max_boxes,
+              score_threshold,
+              iou_threshold)  
+
+    # Run the session with the correct tensors and choose the correct placeholders in the feed_dict.
+    out_boxes, out_scores, out_classes = sess.run(
+            [boxes, scores, classes],
+            feed_dict={
+                model.input: image_data,
+                input_image_shape: [image_data.shape[2], image_data.shape[3]],
+                K.learning_phase(): 0
+            })
+
+    # Print predictions info
+    print('Found {} boxes for {}'.format(len(out_boxes), image_file))
+    # Generate colors for drawing bounding boxes.
+    colors = generate_colors(class_names)
+    # Draw bounding boxes on the image file
+    draw_boxes(image, out_scores, out_boxes, out_classes, class_names, colors)
+    # Save the predicted bounding box on the image
+    image.save(os.path.join("out", image_file.split('/')[-1]), quality=90)
+    # Display the results in the notebook
+    plt.figure()
+
+    output_image = scipy.misc.imread(os.path.join("out", image_file.split('/')[-1]))
+    plt.imshow(output_image)
+
+    return out_scores, out_boxes, out_classes
+
+# Wrap the Yolo model with other model for training: You can select how to wrpait and if you wnat to do transfer learning
+# Create model around yolo model 
+#     Use freeze_body for doing transfer learning on 1st training stage 
+def create_model(anchors, class_names, load_pretrained=True, freeze_body=True):
+    '''
+    returns the body of the model and the model
+
+    # Params:
+
+    load_pretrained: whether or not to load the pretrained model or initialize all weights
+
+    freeze_body: whether or not to freeze all weights except for the last layer's
+
+    # Returns:
+
+    model_body: YOLOv2 with new output layer
+
+    model: YOLOv2 with custom loss Lambda layer
+
+    '''
+
+    detectors_mask_shape = (13, 13, 5, 1)
+    matching_boxes_shape = (13, 13, 5, 5)
+
+    # Create model input layers.
+    image_input = Input(shape=(416, 416, 3))
+    boxes_input = Input(shape=(None, 5))
+    detectors_mask_input = Input(shape=detectors_mask_shape)
+    matching_boxes_input = Input(shape=matching_boxes_shape)
+
+    # Create model body.
+    yolo_model = yolo_body(image_input, len(anchors), len(class_names))
+    topless_yolo = Model(yolo_model.input, yolo_model.layers[-2].output)
+
+    if load_pretrained:
+        # Save topless yolo:
+        topless_yolo_path = os.path.join('model_data', 'yolo_topless.h5')
+        if not os.path.exists(topless_yolo_path):
+            print("CREATING TOPLESS WEIGHTS FILE")
+            yolo_path = os.path.join('model_data', 'yolo.h5')
+            model_body = load_model(yolo_path)
+            model_body = Model(model_body.inputs, model_body.layers[-2].output)
+            model_body.save_weights(topless_yolo_path)
+        topless_yolo.load_weights(topless_yolo_path)
+
+    if freeze_body:
+        for layer in topless_yolo.layers:
+            layer.trainable = False
+    final_layer = Conv2D(len(anchors)*(5+len(class_names)), (1, 1), activation='linear')(topless_yolo.output)
+
+    model_body = Model(image_input, final_layer)
+
+    # Place model loss on CPU to reduce GPU memory usage.
+    with tf.device('/cpu:0'):
+        # TODO: Replace Lambda with custom Keras layer for loss.
+        model_loss = Lambda(
+            yolo_loss,
+            output_shape=(1, ),
+            name='yolo_loss',
+            arguments={'anchors': anchors,
+                       'num_classes': len(class_names)})([
+                           model_body.output, boxes_input,
+                           detectors_mask_input, matching_boxes_input
+                       ])
+
+    model = Model(
+        [model_body.input, boxes_input, detectors_mask_input,
+         matching_boxes_input], model_loss)
+
+    return model_body, model
+
+def get_batch(list_filenames, batch_size,boxes_dir, class_idx,classes_path,anchors_path): 
+    # Get anchors and classes names
+    class_names = get_classes(classes_path)
+    anchors = get_anchors(anchors_path)
+    Img_db = pd.read_csv(boxes_dir, header = 0)
+    while True:
+        for batches in range(len(list_filenames) // batch_size):
+            images_list = []
+            boxes_list = []
+            image_data = None
+            boxes = None
+            for image_sample in list_filenames[batches*batch_size:min(len(list_filenames),(batches+1)*batch_size)]:
+            
+#                 images_list.append( mpimg.imread(image_sample)  )
+                images_list.append( Image.open( image_sample )  )
+
+                # Write the labels and boxes
+                labels_boxes = []
+                #     print(Img_db[Img_db['image_filename']==image_sample.split("/")[-1]].as_matrix())
+                for box_matched in Img_db[Img_db['image_filename']==image_sample.split("/")[-1]].as_matrix():
+                    labels_boxes.append( [class_idx[box_matched[-2]], *box_matched[2:6]] )
+                boxes_list.append(np.asarray(labels_boxes))
+                #print(image_sample)
+            ### Preprocess the data: get images and boxes
+            # get images and boxes
+            image_data, boxes = process_data_pil(images_list, boxes_list)
+        
+            ### Precompute detectors_mask and matching_true_boxes for training
+            # Precompute detectors_mask and matching_true_boxes for training
+            detectors_mask = [0 for i in range(len(boxes))]
+            matching_true_boxes = [0 for i in range(len(boxes))]
+            for i, box in enumerate(boxes):
+                detectors_mask[i], matching_true_boxes[i] = preprocess_true_boxes(box, anchors, [416, 416])
+
+            detectors_mask = np.array(detectors_mask)
+            matching_true_boxes = np.array(matching_true_boxes)
+            
+            # yield x_batch, y_batch
+            yield ( [image_data, boxes, detectors_mask, matching_true_boxes], np.zeros(len(image_data)) )
+            
+            
+def iou(box1, box2): 
+    """Implement the intersection over union (IoU) between box1 and box2
+    
+    Arguments:
+    box1 -- first box, list object with coordinates (x1, y1, x2, y2)
+    box2 -- second box, list object with coordinates (x1, y1, x2, y2)
+    """
+
+    # Calculate the (y1, x1, y2, x2) coordinates of the intersection of box1 and box2. Calculate its Area.
+    ### START CODE HERE ### (≈ 5 lines)
+    xi1 = max(box1[0], box2[0])
+    yi1 = max(box1[1], box2[1])
+    xi2 = min(box1[2], box2[2])
+    yi2 = min(box1[3], box2[3])
+    inter_area = (xi2 - xi1)*(yi2 - yi1)
+    ### END CODE HERE ###    
+
+    # Calculate the Union area by using Formula: Union(A,B) = A + B - Inter(A,B)
+    ### START CODE HERE ### (≈ 3 lines)
+    box1_area = (box1[3] - box1[1])*(box1[2]- box1[0])
+    box2_area = (box2[3] - box2[1])*(box2[2]- box2[0])
+    union_area = (box1_area + box2_area) - inter_area
+    ### END CODE HERE ###
+    
+    # compute the IoU
+    ### START CODE HERE ### (≈ 1 line)
+    iou = float(inter_area) / float(union_area)
+    ### END CODE HERE ###
+
+    return iou
+
+# Batch mAP evaluation
+def mAP_eval(sess , model, image_files,boxes_dir, anchors,class_idx, class_names, max_boxes, score_threshold, iou_threshold=0.5, 
+             iou_eval_threshold = 0.5):
+    # Get head of model
+    yolo_outputs_ = yolo_head(model.output, anchors, len(class_names))
+    input_image_shape = K.placeholder(shape=(2, ))
+    # Get the database
+    Img_db = pd.read_csv(boxes_dir, header = 0)
+    
+    # Get input image size
+    img=plt.imread(image_files[0])
+    img_shape_ = img.shape[0:2]
+#     print(  "Reshaping input image "+str( img_shape_)  +" to model input shape "+str(model_image_size)  )
+    
+    # Get model input size
+    model_image_size =  model.inputs[0].get_shape().as_list()[-3:-1]
+    
+    # Get the Tensors
+    boxes, scores, classes = yolo_eval(yolo_outputs_, [float(i) for i in list(img_shape_)],
+                max_boxes,
+              score_threshold,
+              iou_threshold)
+
+
+    positive_detections = 0
+    positive_samples = 0
+    true_positives = 0
+    for image_file in image_files: # Loop over all the files
+        ## Get models output
+        # Preprocess your image
+        image, image_data = preprocess_image(image_file, model_image_size =  model_image_size )
+        # Run the session with the correct tensors and choose the correct placeholders in the feed_dict.
+        out_boxes, out_scores, out_classes = sess.run(
+                [boxes, scores, classes],
+                feed_dict={
+                    model.input: image_data,
+                    input_image_shape: [image_data.shape[2], image_data.shape[3]],
+                    K.learning_phase(): 0
+                })
+        # output baxes/class matrix
+        labels_boxes_pred = np.insert(out_boxes,0,out_classes.T,axis=1) 
+        
+        ## Get dataset labels/boxes
+        # Write the labels and boxes
+        labels_boxes = []
+
+        for box_matched in Img_db[Img_db['image_filename']==image_file.split("/")[-1]].as_matrix():
+            labels_boxes.append( [class_idx[box_matched[-2]], box_matched[3],box_matched[2],box_matched[5],box_matched[4] ] )
+        labels_boxes_ground = np.asarray(labels_boxes)
+#         print(labels_boxes_pred)
+#         print(labels_boxes_ground)
+        
+        
+        ## Evaluation of all outputs vs. ground-data
+        for i,preds in enumerate(labels_boxes_pred):
+            for j,grounds in enumerate(labels_boxes_ground):
+                if(  iou(preds[1:], grounds[1:]) >= iou_eval_threshold and preds[0] == grounds[0] ):
+                    true_positives += 1
+                    labels_boxes_pred[i][0]=100
+                    labels_boxes_ground[j][0]=200
+
+        # Precision and recall
+        positive_detections += labels_boxes_pred.shape[0]
+        positive_samples += labels_boxes_ground.shape[0]
+    
+#     print(true_positives,positive_samples,positive_detections)
+    
+    if(positive_detections!=0 and positive_samples!=0 ):
+        precision =  float(true_positives) / float(positive_detections)
+        recall =  float(true_positives) / float(positive_samples)
+
+    print( " mean precision = ",precision," , mean recall =  ",recall )
+    print( " Final F1 score =  ",2*precision*recall/(precision+recall) )
+
+#     input("press")    
