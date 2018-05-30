@@ -158,11 +158,13 @@ def get_batch(list_filenames, batch_size,boxes_dir, class_idx,classes_path,ancho
                 images_list.append( Image.open( image_sample )  )
 
                 # Write the labels and boxes
+                # Original boxes stored as 1D list of class, x_min, y_min, x_max, y_max.
                 labels_boxes = []
                 #     print(Img_db[Img_db['image_filename']==image_sample.split("/")[-1]].as_matrix())
                 for box_matched in Img_db[Img_db['image_filename']==image_sample.split("/")[-1]].as_matrix():
                     labels_boxes.append( [class_idx[box_matched[-2]], *box_matched[2:6]] )
                 boxes_list.append(np.asarray(labels_boxes))
+                
                 #print(image_sample)
             ### Preprocess the data: get images and boxes
             # get images and boxes
@@ -214,8 +216,9 @@ def iou(box1, box2):
     return iou
 
 # Batch mAP evaluation
+# Batch mAP evaluation
 def mAP_eval(sess , model, image_files,boxes_dir, anchors,class_idx, class_names, max_boxes, score_threshold, iou_threshold=0.5, 
-             iou_eval_threshold = 0.5):
+             iou_eval_threshold = 0.5, plot_compare = False):
     # Get head of model
     yolo_outputs_ = yolo_head(model.output, anchors, len(class_names))
     input_image_shape = K.placeholder(shape=(2, ))
@@ -240,6 +243,8 @@ def mAP_eval(sess , model, image_files,boxes_dir, anchors,class_idx, class_names
     positive_detections = 0
     positive_samples = 0
     true_positives = 0
+    image = None
+    image_gt = None
     for image_file in image_files: # Loop over all the files
         ## Get models output
         # Preprocess your image
@@ -262,10 +267,45 @@ def mAP_eval(sess , model, image_files,boxes_dir, anchors,class_idx, class_names
         for box_matched in Img_db[Img_db['image_filename']==image_file.split("/")[-1]].as_matrix():
             labels_boxes.append( [class_idx[box_matched[-2]], box_matched[3],box_matched[2],box_matched[5],box_matched[4] ] )
         labels_boxes_ground = np.asarray(labels_boxes)
-#         print(labels_boxes_pred)
-#         print(labels_boxes_ground)
         
+        if plot_compare:
+            if (labels_boxes_ground.shape[0]):
+                # Get image
+                image_gt, _ = preprocess_image(image_file, model_image_size =  model_image_size )
+                # Plot in comparison: Ground truth
+                print(' Ground truth')
+                # Generate colors for drawing bounding boxes.
+                colors = generate_colors(class_names)
+                # Draw bounding boxes on the image file
+    #             print(out_classes,labels_boxes_ground[:,0].astype(int) )
+                draw_boxes(image_gt, np.ones(labels_boxes_ground.shape[0]), labels_boxes_ground[:,1:], labels_boxes_ground[:,0].astype(int), class_names, colors)
+                # Save the predicted bounding box on the image
+                image_gt.save(os.path.join("out_gt", image_file.split('/')[-1]), quality=90)
+                # Display the results in the notebook
+                plt.subplot(121)
+                output_image = scipy.misc.imread(os.path.join("out_gt", image_file.split('/')[-1]))
+                plt.imshow(output_image)
+                plt.title(' Ground truth')
+#                 plt.show()
+
+            # Plot in comparison: Detection
+            print(' Detection')
+            # Generate colors for drawing bounding boxes.
+            colors2 = generate_colors(class_names)
+            # Draw bounding boxes on the image file
+            draw_boxes(image, out_scores, out_boxes, out_classes, class_names, colors2)
+            # Save the predicted bounding box on the image
+            image.save(os.path.join("out", image_file.split('/')[-1]), quality=90)
+            # Display the results in the notebook
+            plt.subplot(122)
+            output_image2 = scipy.misc.imread(os.path.join("out", image_file.split('/')[-1]))
+            plt.imshow(output_image2)
+            plt.title(' Prediction')
+            plt.show()
         
+            # control
+            input("Press a Enter to continue...")
+            
         ## Evaluation of all outputs vs. ground-data
         for i,preds in enumerate(labels_boxes_pred):
             for j,grounds in enumerate(labels_boxes_ground):
@@ -277,7 +317,8 @@ def mAP_eval(sess , model, image_files,boxes_dir, anchors,class_idx, class_names
         # Precision and recall
         positive_detections += labels_boxes_pred.shape[0]
         positive_samples += labels_boxes_ground.shape[0]
-    
+        
+                
 #     print(true_positives,positive_samples,positive_detections)
     
     if(positive_detections!=0 and positive_samples!=0 ):
@@ -287,4 +328,71 @@ def mAP_eval(sess , model, image_files,boxes_dir, anchors,class_idx, class_names
     print( " mean precision = ",precision," , mean recall =  ",recall )
     print( " Final F1 score =  ",2*precision*recall/(precision+recall) )
 
-#     input("press")    
+def nexar_eval_test(sess , model, image_files, boxes_dir, anchors,class_idx, class_names, max_boxes, score_threshold,
+              iou_threshold=0.5, plot_result = False ):
+    ## Evaluate all images in the the image_files list (Test images) and save the results to an Excel files with results
+    # Resturns a Pandas Dataframe as a table with all the outputs boxes, confidences, etc
+    
+    # Define output dict
+    results = { 'image_filename': [],'x0':[],'y0':[],'x1':[],'y1':[],'label':[],'confidence':[] }
+    # Get head of model
+    yolo_outputs_ = yolo_head(model.output, anchors, len(class_names))
+    input_image_shape = K.placeholder(shape=(2, ))
+    # Get the database
+#     Test_img_db = pd.read_csv(boxes_dir, header = 0)
+    
+    # Get input image size
+    img=plt.imread(image_files[0])
+    img_shape_ = img.shape[0:2]
+    
+    # Get model input size
+    model_image_size =  model.inputs[0].get_shape().as_list()[-3:-1]
+    
+    # Get the Tensors
+    boxes, scores, classes = yolo_eval(yolo_outputs_, [float(i) for i in list(img_shape_)],
+                max_boxes,
+              score_threshold,
+              iou_threshold)
+
+    for image_file in image_files: # Loop over all the files
+        ## Get models output
+        # Preprocess your image
+        image, image_data = preprocess_image(image_file, model_image_size =  model_image_size )
+        # Run the session with the correct tensors and choose the correct placeholders in the feed_dict.
+        out_boxes, out_scores, out_classes = sess.run(
+                [boxes, scores, classes],
+                feed_dict={
+                    model.input: image_data,
+                    input_image_shape: [image_data.shape[2], image_data.shape[3]],
+                    K.learning_phase(): 0
+                })
+        if plot_result:
+            # Plot in comparison: Detection
+            # Generate colors for drawing bounding boxes.
+            colors = generate_colors(class_names)
+            # Draw bounding boxes on the image file
+            draw_boxes(image, out_scores, out_boxes, out_classes, class_names, colors)
+            # Save the predicted bounding box on the image
+            image.save(os.path.join("out", image_file.split('/')[-1]), quality=90)
+            # Display the results in the notebook
+            output_image = scipy.misc.imread(os.path.join("out", image_file.split('/')[-1]))
+            plt.imshow(output_image)
+            plt.show()
+            # control
+            input("Press a Enter to continue...")
+            
+        # Save to results AND Swap x and y dimensions: they are ok for ploting but not for submiting
+        # order is x0,y0,x1,y1
+        for i in range(0,out_boxes.shape[0]):
+            results['image_filename'].append( image_file.split('/')[-1] )
+            results['x0'].append( out_boxes[i,1] )
+            results['y0'].append( out_boxes[i,0] )
+            results['x1'].append( out_boxes[i,3] )
+            results['y1'].append( out_boxes[i,2] )
+            results['label'].append(  class_names[ out_classes[i] ] )
+            results['confidence'].append(  out_scores[i] )
+    # To Pandas and Excel
+    df = pd.DataFrame(data=results)
+    df=df[[ 'image_filename','x0','y0','x1','y1','label','confidence' ]]
+    
+    return df

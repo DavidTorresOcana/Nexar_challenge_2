@@ -61,7 +61,7 @@ def draw_boxes(image, out_scores, out_boxes, out_classes, class_names, colors):
 
         draw = ImageDraw.Draw(image)
         label_size = draw.textsize(label, font)
-
+        
         top, left, bottom, right = box
         top = max(0, np.floor(top + 0.5).astype('int32'))
         left = max(0, np.floor(left + 0.5).astype('int32'))
