@@ -21,7 +21,7 @@ from keras import optimizers
 from keras.callbacks import TensorBoard, ModelCheckpoint, EarlyStopping
 
 from yolo_utils import read_classes, read_anchors, generate_colors, preprocess_image, draw_boxes, scale_boxes
-from retrain_yolo import process_data,process_data_pil,get_classes,get_anchors,get_detector_mask,train,draw
+from retrain_yolo import process_data,process_data_pil,process_data_pil_wide,get_classes,get_anchors,get_detector_mask,train,draw
 from yad2k.models.keras_yolo import yolo_head, yolo_boxes_to_corners, preprocess_true_boxes, yolo_loss, yolo_body, yolo_eval
 
 
@@ -146,6 +146,79 @@ def create_model(anchors, class_names, load_pretrained=True, freeze_body=True, r
          matching_boxes_input], model_loss)
 
     return model_body, model
+def create_model_wide(anchors, class_names, load_pretrained=True, freeze_body=True, regularization_rate = 0.01):
+    '''
+    returns the body of the model and the model
+
+    # Params:
+
+    load_pretrained: whether or not to load the pretrained model or initialize all weights
+
+    freeze_body: whether or not to freeze all weights except for the last layer's
+
+    # Returns:
+
+    model_body: YOLOv2 with new output layer
+
+    model: YOLOv2 with custom loss Lambda layer
+
+    '''
+
+    detectors_mask_shape = (13, 19, 5, 1)
+    matching_boxes_shape = (13, 19, 5, 5)
+
+    # Create model input layers.
+    image_input = Input(shape=(416, 608, 3))
+    boxes_input = Input(shape=(None, 5))
+    detectors_mask_input = Input(shape=detectors_mask_shape)
+    matching_boxes_input = Input(shape=matching_boxes_shape)
+
+    # Create model body.
+    yolo_model = yolo_body(image_input, len(anchors), len(class_names))
+    topless_yolo = Model(yolo_model.input, yolo_model.layers[-2].output)
+
+    if load_pretrained:
+        # Save topless yolo:
+        topless_yolo_path = os.path.join('model_data', 'yolo_topless.h5')
+        if not os.path.exists(topless_yolo_path):
+            print("CREATING TOPLESS WEIGHTS FILE")
+            yolo_path = os.path.join('model_data', 'yolo.h5')
+            model_body = load_model(yolo_path)
+            model_body = Model(model_body.inputs, model_body.layers[-2].output)
+            model_body.save_weights(topless_yolo_path)
+        topless_yolo.load_weights(topless_yolo_path)
+
+    if freeze_body:
+        for layer in topless_yolo.layers:
+            layer.trainable = False
+    final_layer = Conv2D(len(anchors)*(5+len(class_names)), (1, 1), activation='linear')(topless_yolo.output)
+    
+    # Implement regularization
+    if regularization_rate: # if we want regularization
+        for layer in topless_yolo.layers:
+            if hasattr(layer, 'kernel_regularizer'):
+                layer.kernel_regularizer = regularization_rate
+    
+    model_body = Model(image_input, final_layer)
+
+    # Place model loss on CPU to reduce GPU memory usage.
+    with tf.device('/cpu:0'):
+        # TODO: Replace Lambda with custom Keras layer for loss.
+        model_loss = Lambda(
+            yolo_loss,
+            output_shape=(1, ),
+            name='yolo_loss',
+            arguments={'anchors': anchors,
+                       'num_classes': len(class_names)})([
+                           model_body.output, boxes_input,
+                           detectors_mask_input, matching_boxes_input
+                       ])
+
+    model = Model(
+        [model_body.input, boxes_input, detectors_mask_input,
+         matching_boxes_input], model_loss)
+
+    return model_body, model
 
 def get_batch(list_filenames, batch_size,boxes_dir, class_idx,classes_path,anchors_path): 
     # Get anchors and classes names
@@ -189,7 +262,48 @@ def get_batch(list_filenames, batch_size,boxes_dir, class_idx,classes_path,ancho
             # yield x_batch, y_batch
             yield ( [image_data, boxes, detectors_mask, matching_true_boxes], np.zeros(len(image_data)) )
             
+def get_batch_wide(list_filenames, batch_size,boxes_dir, class_idx,classes_path,anchors_path): 
+    # Get anchors and classes names
+    class_names = get_classes(classes_path)
+    anchors = get_anchors(anchors_path)
+    Img_db = pd.read_csv(boxes_dir, header = 0)
+    while True:
+        for batches in range(len(list_filenames) // batch_size):
+            images_list = []
+            boxes_list = []
+            image_data = None
+            boxes = None
+            for image_sample in list_filenames[batches*batch_size:min(len(list_filenames),(batches+1)*batch_size)]:
             
+#                 images_list.append( mpimg.imread(image_sample)  )
+                images_list.append( Image.open( image_sample )  )
+
+                # Write the labels and boxes
+                # Original boxes stored as 1D list of class, x_min, y_min, x_max, y_max.
+                labels_boxes = []
+                #     print(Img_db[Img_db['image_filename']==image_sample.split("/")[-1]].as_matrix())
+                for box_matched in Img_db[Img_db['image_filename']==image_sample.split("/")[-1]].as_matrix():
+                    labels_boxes.append( [class_idx[box_matched[-2]], *box_matched[2:6]] )
+                boxes_list.append(np.asarray(labels_boxes))
+                
+                #print(image_sample)
+            ### Preprocess the data: get images and boxes
+            # get images and boxes
+            image_data, boxes = process_data_pil_wide(images_list, boxes_list)
+#             print(image_data.shape)
+            ### Precompute detectors_mask and matching_true_boxes for training
+            # Precompute detectors_mask and matching_true_boxes for training
+            detectors_mask = [0 for i in range(len(boxes))]
+            matching_true_boxes = [0 for i in range(len(boxes))]
+            for i, box in enumerate(boxes):
+                detectors_mask[i], matching_true_boxes[i] = preprocess_true_boxes(box, anchors, [416, 608])
+
+            detectors_mask = np.array(detectors_mask)
+            matching_true_boxes = np.array(matching_true_boxes)
+            
+            # yield x_batch, y_batch
+            yield ( [image_data, boxes, detectors_mask, matching_true_boxes], np.zeros(len(image_data)) )
+                        
 def iou(box1, box2): 
     """Implement the intersection over union (IoU) between box1 and box2
     
