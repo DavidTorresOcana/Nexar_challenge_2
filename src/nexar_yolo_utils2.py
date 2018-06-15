@@ -73,7 +73,7 @@ def predict_any(sess , model, image_file, anchors, class_names, max_boxes, score
 # Wrap the Yolo model with other model for training: You can select how to wrpait and if you wnat to do transfer learning
 # Create model around yolo model 
 #     Use freeze_body for doing transfer learning on 1st training stage 
-def create_model(anchors, class_names, load_pretrained=True, freeze_body=True):
+def create_model(anchors, class_names, load_pretrained=True, freeze_body=True, regularization_rate = 0.01):
     '''
     returns the body of the model and the model
 
@@ -119,7 +119,13 @@ def create_model(anchors, class_names, load_pretrained=True, freeze_body=True):
         for layer in topless_yolo.layers:
             layer.trainable = False
     final_layer = Conv2D(len(anchors)*(5+len(class_names)), (1, 1), activation='linear')(topless_yolo.output)
-
+    
+    # Implement regularization
+    if regularization_rate: # if we want regularization
+        for layer in topless_yolo.layers:
+            if hasattr(layer, 'kernel_regularizer'):
+                layer.kernel_regularizer = regularization_rate
+    
     model_body = Model(image_input, final_layer)
 
     # Place model loss on CPU to reduce GPU memory usage.

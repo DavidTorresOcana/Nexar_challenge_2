@@ -405,7 +405,7 @@ def preprocess_true_boxes(true_boxes, anchors, image_size):
             box_mins = -box_maxes
             anchor_maxes = (anchor / 2.)
             anchor_mins = -anchor_maxes
-
+            
             intersect_mins = np.maximum(box_mins, anchor_mins)
             intersect_maxes = np.minimum(box_maxes, anchor_maxes)
             intersect_wh = np.maximum(intersect_maxes - intersect_mins, 0.)
