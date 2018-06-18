@@ -200,7 +200,8 @@ def create_model_wide(anchors, class_names, load_pretrained=True, freeze_body=Tr
                 layer.kernel_regularizer = regularization_rate
     
     model_body = Model(image_input, final_layer)
-
+    
+#     print(model_body.output)
     # Place model loss on CPU to reduce GPU memory usage.
     with tf.device('/cpu:0'):
         # TODO: Replace Lambda with custom Keras layer for loss.
