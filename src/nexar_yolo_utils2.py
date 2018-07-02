@@ -17,12 +17,12 @@ import tensorflow as tf
 from keras import backend as K
 from keras.layers import Input, Lambda, Conv2D
 from keras.models import load_model, Model
-from keras import optimizers
+from keras import optimizers, initializers
 from keras.callbacks import TensorBoard, ModelCheckpoint, EarlyStopping
 
 from yolo_utils import read_classes, read_anchors, generate_colors, preprocess_image, draw_boxes, scale_boxes
 from retrain_yolo import process_data,process_data_pil,process_data_pil_wide,get_classes,get_anchors,get_detector_mask,train,draw
-from yad2k.models.keras_yolo import yolo_head, yolo_boxes_to_corners, preprocess_true_boxes, yolo_loss, yolo_body, yolo_eval
+from yad2k.models.keras_yolo import yolo_head, yolo_boxes_to_corners, preprocess_true_boxes,preprocess_true_boxes_true_box, yolo_loss, yolo_body, yolo_eval
 
 
 def predict_any(sess , model, image_file, anchors, class_names, max_boxes, score_threshold, iou_threshold):
@@ -30,7 +30,7 @@ def predict_any(sess , model, image_file, anchors, class_names, max_boxes, score
     # Get head of model
     yolo_outputs_ = yolo_head(model.output, anchors, len(class_names))
     input_image_shape = K.placeholder(shape=(2, ))
-
+    
     # Preprocess your image
     model_image_size =  model.inputs[0].get_shape().as_list()[-3:-1]
     image, image_data = preprocess_image(image_file, model_image_size =  model_image_size )
@@ -38,7 +38,9 @@ def predict_any(sess , model, image_file, anchors, class_names, max_boxes, score
     img=plt.imread(image_file)
     img_shape_ = img.shape[0:2]
     print(  "Reshaping input image "+str( img_shape_)  +" to model input shape "+str(model_image_size)  )
-    
+    if img_shape_[0]>img_shape_[1]:
+        print( "Wrong input size ",str( img_shape_), " Exiting"  )
+        return (0,0,0)
     # Get the Tensors
     boxes, scores, classes = yolo_eval(yolo_outputs_, [float(i) for i in list(img_shape_)],
                 max_boxes,
@@ -146,7 +148,9 @@ def create_model(anchors, class_names, load_pretrained=True, freeze_body=True, r
          matching_boxes_input], model_loss)
 
     return model_body, model
-def create_model_wide(anchors, class_names, load_pretrained=True, freeze_body=True, regularization_rate = 0.01):
+
+def create_model_wide(sess,anchors, class_names, load_pretrained=True, freeze_body=True, regularization_rate = 0.01,
+                      initialize_weights = False):
     '''
     returns the body of the model and the model
 
@@ -176,7 +180,7 @@ def create_model_wide(anchors, class_names, load_pretrained=True, freeze_body=Tr
     # Create model body.
     yolo_model = yolo_body(image_input, len(anchors), len(class_names))
     topless_yolo = Model(yolo_model.input, yolo_model.layers[-2].output)
-
+    
     if load_pretrained:
         # Save topless yolo:
         topless_yolo_path = os.path.join('model_data', 'yolo_topless.h5')
@@ -193,14 +197,21 @@ def create_model_wide(anchors, class_names, load_pretrained=True, freeze_body=Tr
             layer.trainable = False
     final_layer = Conv2D(len(anchors)*(5+len(class_names)), (1, 1), activation='linear')(topless_yolo.output)
     
+    model_body = Model(image_input, final_layer)
+    
     # Implement regularization
     if regularization_rate: # if we want regularization
-        for layer in topless_yolo.layers:
+        for layer in model_body.layers:
             if hasattr(layer, 'kernel_regularizer'):
                 layer.kernel_regularizer = regularization_rate
     
-    model_body = Model(image_input, final_layer)
-    
+    # Implement initialize_weights
+    if initialize_weights: # if we want initialize
+        for layer in model_body.layers:
+            if hasattr(layer, 'kernel_initializer'):
+                layer.kernel_initializer = initializers.get("glorot_uniform")
+                layer.kernel.initializer.run(session=sess)
+                
 #     print(model_body.output)
     # Place model loss on CPU to reduce GPU memory usage.
     with tf.device('/cpu:0'):
@@ -236,7 +247,7 @@ def get_batch(list_filenames, batch_size,boxes_dir, class_idx,classes_path,ancho
             
 #                 images_list.append( mpimg.imread(image_sample)  )
                 images_list.append( Image.open( image_sample )  )
-
+                                   
                 # Write the labels and boxes
                 # Original boxes stored as 1D list of class, x_min, y_min, x_max, y_max.
                 labels_boxes = []
@@ -245,6 +256,12 @@ def get_batch(list_filenames, batch_size,boxes_dir, class_idx,classes_path,ancho
                     labels_boxes.append( [class_idx[box_matched[-2]], *box_matched[2:6]] )
                 boxes_list.append(np.asarray(labels_boxes))
                 
+                # Check if image is fliped and portrait it
+                if images_list[-1].width<images_list[-1].height:
+                    images_list[-1] = images_list[-1].transpose(Image.TRANSPOSE)
+                    for i,boxs in enumerate(boxes_list[-1]) :
+                        boxes_list[-1][i] =  [  boxs[0], boxs[2],boxs[1],boxs[4],boxs[3]  ]
+                        
                 #print(image_sample)
             ### Preprocess the data: get images and boxes
             # get images and boxes
@@ -263,7 +280,7 @@ def get_batch(list_filenames, batch_size,boxes_dir, class_idx,classes_path,ancho
             # yield x_batch, y_batch
             yield ( [image_data, boxes, detectors_mask, matching_true_boxes], np.zeros(len(image_data)) )
             
-def get_batch_wide(list_filenames, batch_size,boxes_dir, class_idx,classes_path,anchors_path): 
+def get_batch_wide(list_filenames, batch_size,boxes_dir, class_idx,classes_path,anchors_path,true_boxes_flag=False): 
     # Get anchors and classes names
     class_names = get_classes(classes_path)
     anchors = get_anchors(anchors_path)
@@ -287,6 +304,13 @@ def get_batch_wide(list_filenames, batch_size,boxes_dir, class_idx,classes_path,
                     labels_boxes.append( [class_idx[box_matched[-2]], *box_matched[2:6]] )
                 boxes_list.append(np.asarray(labels_boxes))
                 
+                
+                # Check if image is fliped and portrait it
+                if images_list[-1].width<images_list[-1].height:
+                    images_list[-1] = images_list[-1].transpose(Image.TRANSPOSE)
+                    for i,boxs in enumerate(boxes_list[-1]) :
+                        boxes_list[-1][i] =  [  boxs[0], boxs[2],boxs[1],boxs[4],boxs[3]  ]
+                    
                 #print(image_sample)
             ### Preprocess the data: get images and boxes
             # get images and boxes
@@ -296,15 +320,20 @@ def get_batch_wide(list_filenames, batch_size,boxes_dir, class_idx,classes_path,
             # Precompute detectors_mask and matching_true_boxes for training
             detectors_mask = [0 for i in range(len(boxes))]
             matching_true_boxes = [0 for i in range(len(boxes))]
-            for i, box in enumerate(boxes):
-                detectors_mask[i], matching_true_boxes[i] = preprocess_true_boxes(box, anchors, [416, 608])
-
+            
+            if true_boxes_flag:
+                for i, box in enumerate(boxes):
+                    detectors_mask[i], matching_true_boxes[i] = preprocess_true_boxes_true_box(box, anchors, [416, 608])
+            else:
+                for i, box in enumerate(boxes):
+                    detectors_mask[i], matching_true_boxes[i] = preprocess_true_boxes(box, anchors, [416, 608])
+                    
+            
             detectors_mask = np.array(detectors_mask)
             matching_true_boxes = np.array(matching_true_boxes)
             
             # yield x_batch, y_batch
             yield ( [image_data, boxes, detectors_mask, matching_true_boxes], np.zeros(len(image_data)) )
-                        
 def iou(box1, box2): 
     """Implement the intersection over union (IoU) between box1 and box2
     
@@ -370,6 +399,9 @@ def mAP_eval(sess , model, image_files,boxes_dir, anchors,class_idx, class_names
         ## Get models output
         # Preprocess your image
         image, image_data = preprocess_image(image_file, model_image_size =  model_image_size )
+        if image.width<image.height:
+            print( "Wrong input size, Passing"  )
+            pass
         # Run the session with the correct tensors and choose the correct placeholders in the feed_dict.
         out_boxes, out_scores, out_classes = sess.run(
                 [boxes, scores, classes],
@@ -378,7 +410,7 @@ def mAP_eval(sess , model, image_files,boxes_dir, anchors,class_idx, class_names
                     input_image_shape: [image_data.shape[2], image_data.shape[3]],
                     K.learning_phase(): 0
                 })
-        # output baxes/class matrix
+        # output boxes/class matrix
         labels_boxes_pred = np.insert(out_boxes,0,out_classes.T,axis=1) 
         
         ## Get dataset labels/boxes
@@ -517,3 +549,84 @@ def nexar_eval_test(sess , model, image_files, boxes_dir, anchors,class_idx, cla
     df=df[[ 'image_filename','x0','y0','x1','y1','label','confidence' ]]
     
     return df
+def preprocess_true_boxes_true_box(true_boxes, anchors, image_size):
+    """Find detector in YOLO where ground truth box should appear.
+
+    Parameters
+    ----------
+    true_boxes : array
+        List of ground truth boxes in form of relative x, y, w, h, class.
+        Relative coordinates are in the range [0, 1] indicating a percentage
+        of the original image dimensions.
+    anchors : array
+        List of anchors in form of w, h.
+        Anchors are assumed to be in the range [0, conv_size] where conv_size
+        is the spatial dimension of the final convolutional features.
+    image_size : array-like
+        List of image dimensions in form of h, w in pixels.
+
+    Returns
+    -------
+    detectors_mask : array
+        0/1 mask for detectors in [conv_height, conv_width, num_anchors, 1]
+        that should be compared with a matching ground truth box.
+    matching_true_boxes: array
+        Same shape as detectors_mask with the corresponding ground truth box
+        adjusted for comparison with predicted parameters at training time.
+    """
+    height, width = image_size
+    num_anchors = len(anchors)
+    # Downsampling factor of 5x 2-stride max_pools == 32.
+    # TODO: Remove hardcoding of downscaling calculations.
+    assert height % 32 == 0, 'Image sizes in YOLO_v2 must be multiples of 32.'
+    assert width % 32 == 0, 'Image sizes in YOLO_v2 must be multiples of 32.'
+    conv_height = height // 32
+    conv_width = width // 32
+#     print(conv_width,conv_height)
+    num_box_params = true_boxes.shape[1]
+    detectors_mask = np.zeros(
+        (conv_height, conv_width, num_anchors, 1), dtype=np.float32)
+    matching_true_boxes = np.zeros(
+        (conv_height, conv_width, num_anchors, num_box_params),
+        dtype=np.float32)
+#     print(detectors_mask.shape)
+    for box in true_boxes:
+        # scale box to convolutional feature spatial dimensions
+        box_class = box[4:5]
+        box = box[0:4] * np.array(
+            [conv_width, conv_height, conv_width, conv_height])
+        i = np.floor(box[1]).astype('int')
+        j = np.floor(box[0]).astype('int')
+        best_iou = 0
+        best_anchor = 0
+        for k, anchor in enumerate(anchors):
+            # Find IOU between box shifted to origin and anchor box.
+            box_maxes = box[2:4] / 2.
+            box_mins = -box_maxes
+            anchor_maxes = (anchor / 2.)
+            anchor_mins = -anchor_maxes
+            
+            intersect_mins = np.maximum(box_mins, anchor_mins)
+            intersect_maxes = np.minimum(box_maxes, anchor_maxes)
+            intersect_wh = np.maximum(intersect_maxes - intersect_mins, 0.)
+            intersect_area = intersect_wh[0] * intersect_wh[1]
+            box_area = box[2] * box[3]
+            anchor_area = anchor[0] * anchor[1]
+            iou = intersect_area / (box_area + anchor_area - intersect_area)
+            if iou > best_iou:
+                best_iou = iou
+                best_anchor = k
+
+        if best_iou > 0:
+            detectors_mask[i, j, best_anchor] = 1
+            adjusted_box = np.array(
+                [
+                    box[0] - j, box[1] - i,
+#                     np.log(box[2] / anchors[best_anchor][0]),
+#                     np.log(box[3] / anchors[best_anchor][1]), box_class
+                    box[2],
+                    box[3], box_class
+                ],
+                dtype=np.float32)
+            matching_true_boxes[i, j, best_anchor] = adjusted_box
+    return detectors_mask, matching_true_boxes

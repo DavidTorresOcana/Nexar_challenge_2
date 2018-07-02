@@ -146,7 +146,7 @@ def process_data(images, boxes=None):
 def process_data_pil(images, boxes=None):
     '''processes the data'''
 #     images = [PIL.Image.fromarray(i) for i in images]
-    orig_size = np.array([max(images[0].width,images[0].height), min(images[0].width,images[0].height)])
+    orig_size = np.array([images[0].width, images[0].height])
     orig_size = np.expand_dims(orig_size, axis=0)
 
     # Image preprocessing.
@@ -187,9 +187,10 @@ def process_data_pil(images, boxes=None):
 def process_data_pil_wide(images, boxes=None):
     '''processes the data'''
 #     images = [PIL.Image.fromarray(i) for i in images]
-    orig_size = np.array([max(images[0].width,images[0].height), min(images[0].width,images[0].height)])
+    orig_size = np.array([images[0].width, images[0].height])
     orig_size = np.expand_dims(orig_size, axis=0)
 #     print(images[0].width,images[0].height)
+    
     # Image preprocessing.
     processed_images = [i.resize((608, 416), PIL.Image.BICUBIC) for i in images]
     processed_images = [np.array(image, dtype=np.float) for image in processed_images]

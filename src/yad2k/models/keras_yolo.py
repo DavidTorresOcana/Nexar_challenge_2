@@ -97,24 +97,41 @@ def yolo_head(feats, anchors, num_classes):
 
     # Dynamic implementation of conv dims for fully convolutional model.
     conv_dims = K.shape(feats)[1:3]  # assuming channels last
-    # In YOLO the height index is the inner most iteration.
+#     # In YOLO the height index is the inner most iteration.
+#     conv_height_index = K.arange(0, stop=conv_dims[0])
+#     conv_width_index = K.arange(0, stop=conv_dims[1])
+#     conv_height_index = K.tile(conv_height_index, [conv_dims[1]])
+
+#     # TODO: Repeat_elements and tf.split doesn't support dynamic splits.
+#     # conv_width_index = K.repeat_elements(conv_width_index, conv_dims[1], axis=0)
+#     conv_width_index = K.tile(
+#         K.expand_dims(conv_width_index, 0), [conv_dims[0], 1])
+#     conv_width_index = K.flatten(K.transpose(conv_width_index))
+#     conv_index = K.transpose(K.stack([conv_height_index, conv_width_index]))
+#     conv_index = K.reshape(conv_index, [1, conv_dims[0], conv_dims[1], 1, 2])
+#     conv_index = K.cast(conv_index, K.dtype(feats))
+
+#     feats = K.reshape(
+#         feats, [-1, conv_dims[0], conv_dims[1], num_anchors, num_classes + 5])
+#     conv_dims = K.cast(K.reshape(conv_dims, [1, 1, 1, 1, 2]), K.dtype(feats))
+
+    # Fixes as indicated here: https://github.com/allanzelener/YAD2K/issues/51 and https://github.com/allanzelener/YAD2K/issues/86
     conv_height_index = K.arange(0, stop=conv_dims[0])
     conv_width_index = K.arange(0, stop=conv_dims[1])
-    conv_height_index = K.tile(conv_height_index, [conv_dims[1]])
+    conv_height_index = tf.transpose(tf.tile(tf.expand_dims(conv_height_index, 0), [conv_dims[1], 1]))
 
     # TODO: Repeat_elements and tf.split doesn't support dynamic splits.
     # conv_width_index = K.repeat_elements(conv_width_index, conv_dims[1], axis=0)
-    conv_width_index = K.tile(
-        K.expand_dims(conv_width_index, 0), [conv_dims[0], 1])
-    conv_width_index = K.flatten(K.transpose(conv_width_index))
-    conv_index = K.transpose(K.stack([conv_height_index, conv_width_index]))
-    conv_index = K.reshape(conv_index, [1, conv_dims[0], conv_dims[1], 1, 2])
+    conv_width_index = tf.tile(tf.expand_dims(conv_width_index, 0), [conv_dims[0], 1])
+    conv_index = tf.stack([conv_width_index, conv_height_index], -1)
+    conv_index = tf.reshape(conv_index, [1, conv_dims[0], conv_dims[1], 1, 2])
     conv_index = K.cast(conv_index, K.dtype(feats))
 
     feats = K.reshape(
         feats, [-1, conv_dims[0], conv_dims[1], num_anchors, num_classes + 5])
+    conv_dims = tf.reverse(conv_dims, [-1])
     conv_dims = K.cast(K.reshape(conv_dims, [1, 1, 1, 1, 2]), K.dtype(feats))
-
+    
     # Static generation of conv_index:
     # conv_index = np.array([_ for _ in np.ndindex(conv_width, conv_height)])
     # conv_index = conv_index[:, [1, 0]]  # swap columns for YOLO ordering.
@@ -424,6 +441,88 @@ def preprocess_true_boxes(true_boxes, anchors, image_size):
                     box[0] - j, box[1] - i,
                     np.log(box[2] / anchors[best_anchor][0]),
                     np.log(box[3] / anchors[best_anchor][1]), box_class
+                ],
+                dtype=np.float32)
+            matching_true_boxes[i, j, best_anchor] = adjusted_box
+    return detectors_mask, matching_true_boxes
+
+def preprocess_true_boxes_true_box(true_boxes, anchors, image_size):
+    """Find detector in YOLO where ground truth box should appear.
+
+    Parameters
+    ----------
+    true_boxes : array
+        List of ground truth boxes in form of relative x, y, w, h, class.
+        Relative coordinates are in the range [0, 1] indicating a percentage
+        of the original image dimensions.
+    anchors : array
+        List of anchors in form of w, h.
+        Anchors are assumed to be in the range [0, conv_size] where conv_size
+        is the spatial dimension of the final convolutional features.
+    image_size : array-like
+        List of image dimensions in form of h, w in pixels.
+
+    Returns
+    -------
+    detectors_mask : array
+        0/1 mask for detectors in [conv_height, conv_width, num_anchors, 1]
+        that should be compared with a matching ground truth box.
+    matching_true_boxes: array
+        Same shape as detectors_mask with the corresponding ground truth box
+        adjusted for comparison with predicted parameters at training time.
+    """
+    height, width = image_size
+    num_anchors = len(anchors)
+    # Downsampling factor of 5x 2-stride max_pools == 32.
+    # TODO: Remove hardcoding of downscaling calculations.
+    assert height % 32 == 0, 'Image sizes in YOLO_v2 must be multiples of 32.'
+    assert width % 32 == 0, 'Image sizes in YOLO_v2 must be multiples of 32.'
+    conv_height = height // 32
+    conv_width = width // 32
+#     print(conv_width,conv_height)
+    num_box_params = true_boxes.shape[1]
+    detectors_mask = np.zeros(
+        (conv_height, conv_width, num_anchors, 1), dtype=np.float32)
+    matching_true_boxes = np.zeros(
+        (conv_height, conv_width, num_anchors, num_box_params),
+        dtype=np.float32)
+#     print(detectors_mask.shape)
+    for box in true_boxes:
+        # scale box to convolutional feature spatial dimensions
+        box_class = box[4:5]
+        box = box[0:4] * np.array(
+            [conv_width, conv_height, conv_width, conv_height])
+        i = np.floor(box[1]).astype('int')
+        j = np.floor(box[0]).astype('int')
+        best_iou = 0
+        best_anchor = 0
+        for k, anchor in enumerate(anchors):
+            # Find IOU between box shifted to origin and anchor box.
+            box_maxes = box[2:4] / 2.
+            box_mins = -box_maxes
+            anchor_maxes = (anchor / 2.)
+            anchor_mins = -anchor_maxes
+            
+            intersect_mins = np.maximum(box_mins, anchor_mins)
+            intersect_maxes = np.minimum(box_maxes, anchor_maxes)
+            intersect_wh = np.maximum(intersect_maxes - intersect_mins, 0.)
+            intersect_area = intersect_wh[0] * intersect_wh[1]
+            box_area = box[2] * box[3]
+            anchor_area = anchor[0] * anchor[1]
+            iou = intersect_area / (box_area + anchor_area - intersect_area)
+            if iou > best_iou:
+                best_iou = iou
+                best_anchor = k
+
+        if best_iou > 0:
+            detectors_mask[i, j, best_anchor] = 1
+            adjusted_box = np.array(
+                [
+                    box[0] - j, box[1] - i,
+#                     np.log(box[2] / anchors[best_anchor][0]),
+#                     np.log(box[3] / anchors[best_anchor][1]), box_class
+                    box[2],
+                    box[3], box_class
                 ],
                 dtype=np.float32)
             matching_true_boxes[i, j, best_anchor] = adjusted_box
